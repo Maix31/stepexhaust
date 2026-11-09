@@ -109,17 +109,23 @@ vec3 phong_bling(in Scene s, vec3 p)
     return mix(c, s.dl.c ,d);  
 }
 
+vec3 checker(vec3 p)
+{
+        
+    vec2 g = floor(p.xz);
+    return vec3(mod(g.x + g.y, 2.0));
+}
 vec3 color(int m, in Scene s, vec3 p)
 {
     switch (m) {
         case SPHERE_MAT: {
-           return phong_bling(s, p);
+           return checker(p);
+           // return phong_bling(s, p);
         }
         // case FLOOR_MAT: return vec3(1);
         case FLOOR_MAT:
         {
-            vec2 g = floor(p.xz);
-            return vec3(mod(g.x + g.y, 2.0));
+            return checker(p);
         }
         // case NO_HIT_DISTANCE_EXHAUST_MAT: return vec3(0,1,1);
         case NO_HIT_DISTANCE_EXHAUST_MAT:
