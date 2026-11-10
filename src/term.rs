@@ -73,13 +73,13 @@ impl Term {
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
         self.buf.clear();
         // Synchronized update: avoids tearing on terminals that support it.
-        self.buf.extend_from_slice(b"\x1b[?2026h\x1b[H");
+        self.buf.extend_from_slice(b"\x1b[?2026h\x1b[2;1H"); // image starts below the top status row
         if self.kitty {
             self.kitty_image(rgba, w, h, cols, rows.saturating_sub(1).max(1));
         } else {
             self.half_blocks(rgba, w, h, cols, rows.saturating_sub(1).max(1));
         }
-        self.status_line(info, status, is_err, cols, rows);
+        self.status_line(info, status, is_err, cols);
         self.buf.extend_from_slice(b"\x1b[?2026l");
         self.out.write_all(&self.buf)?;
         self.out.flush()?;
@@ -96,7 +96,7 @@ impl Term {
         let mut last: Option<([u8; 3], [u8; 3])> = None;
         for row in 0..rows as u32 {
             // Move to the start of each row explicitly: robust against wrapping.
-            self.buf.extend_from_slice(format!("\x1b[{};1H", row + 1).as_bytes());
+            self.buf.extend_from_slice(format!("\x1b[{};1H", row + 2).as_bytes());
             for col in 0..cols as u32 {
                 // Nearest-neighbour map from cell grid onto the render target.
                 let x = col * w / cols as u32;
@@ -151,7 +151,7 @@ impl Term {
         }
     }
 
-    fn status_line(&mut self, info: &str, status: &str, is_err: bool, cols: u16, rows: u16) {
+    fn status_line(&mut self, info: &str, status: &str, is_err: bool, cols: u16) {
         // Only the first line of an error, so the layout never jumps around.
         let msg = if is_err {
             format!("ERROR {}", status.lines().next().unwrap_or(""))
@@ -162,7 +162,7 @@ impl Term {
         let pad = (cols as usize).saturating_sub(s.chars().count());
         s.push_str(&" ".repeat(pad));
         let color = if is_err { "\x1b[97;41m" } else { "\x1b[30;47m" };
-        let _ = write!(self.buf, "\x1b[{};1H{color}{s}\x1b[0m", rows);
+        let _ = write!(self.buf, "\x1b[1;1H{color}{s}\x1b[0m");
     }
 }
 

@@ -28,7 +28,10 @@ struct State {
     mouse: [f32; 4],
     cursor: [f32; 2],
     fps_ema: f32,
+    render_ms_ema: f32,
     last_title: Instant,
+    last_overlay: Option<Instant>,
+    last_err: Option<String>,
 }
 
 struct App {
@@ -48,7 +51,8 @@ pub fn run(file: PathBuf) -> Result<()> {
     let target = abs.clone();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(ev) = res {
-            if ev.paths.iter().any(|p| p.file_name() == target.file_name()) {
+            // Ignore Access events: our own read of the file would otherwise retrigger a reload forever.
+            if !ev.kind.is_access() && ev.paths.iter().any(|p| p.file_name() == target.file_name()) {
                 let _ = tx.send(());
             }
         }
@@ -107,7 +111,10 @@ impl State {
             mouse: [0.0; 4],
             cursor: [0.0; 2],
             fps_ema: 60.0,
+            render_ms_ema: 0.0,
             last_title: Instant::now(),
+            last_overlay: None,
+            last_err: None,
         };
         st.load(file);
         Ok(st)
@@ -119,15 +126,40 @@ impl State {
             .and_then(|src| self.gpu.set_shader(&src));
         match res {
             Ok(()) => {
+                self.last_err = None;
+                self.last_overlay = None; // bring the ms counter back right away
                 self.status = "ok".into();
                 self.status_is_err = false;
             }
             Err(e) => {
-                eprintln!("{}: {e}", file.display());
+                if self.last_err.as_deref() != Some(e.as_str()) {
+                    eprintln!("{}: {e}", file.display());
+                    self.last_err = Some(e.clone());
+                }
                 self.status = e.lines().next().unwrap_or("error").to_string();
                 self.status_is_err = true;
+                self.show_error();
             }
         }
+    }
+
+    /// Pixels per font pixel for on-image text, scaled with the window height.
+    fn text_scale(&self) -> u32 {
+        (self.config.height / 440).max(1)
+    }
+
+    /// Draw the full compile error over the (last good) frame.
+    fn show_error(&mut self) {
+        let Some(err) = self.last_err.clone() else { return };
+        let scale = self.text_scale();
+        let cols = (self.config.width / (8 * scale)).saturating_sub(1) as usize;
+        self.gpu.set_overlay(
+            &format!("SHADER ERROR\n{err}"),
+            [255, 255, 255],
+            [150, 0, 0],
+            scale,
+            cols,
+        );
     }
 
     fn resize(&mut self) {
@@ -138,6 +170,9 @@ impl State {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.gpu.device, &self.config);
+        if self.status_is_err {
+            self.show_error(); // re-wrap for the new window size
+        }
     }
 
     fn toggle_pause(&mut self) {
@@ -190,18 +225,38 @@ impl State {
         .as_secs_f32();
 
         let view = frame.texture.create_view(&Default::default());
+        // Submit, then wait for the GPU so we can time the actual render work
+        // (without the wait we would only measure command submission).
+        let render_start = Instant::now();
         self.gpu
             .render_to_view(&view, w, h, t, delta, self.frame_no, self.mouse);
+        let _ = self.gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        let render_ms = render_start.elapsed().as_secs_f32() * 1000.0;
+        self.render_ms_ema = if self.render_ms_ema == 0.0 {
+            render_ms
+        } else {
+            self.render_ms_ema * 0.95 + render_ms * 0.05
+        };
         if self.paused_at.is_none() {
             self.frame_no = self.frame_no.wrapping_add(1);
         }
         self.window.pre_present_notify();
         self.gpu.queue.present(frame);
 
+        // On-image render time: whole milliseconds, refreshed every 5 s.
+        if !self.status_is_err
+            && self.last_overlay.map_or(true, |t| t.elapsed() > Duration::from_secs(5))
+        {
+            self.last_overlay = Some(Instant::now());
+            let (scale, cols) = (self.text_scale(), 32);
+            self.gpu.set_overlay(&format!("{:.0}ms", self.render_ms_ema), [150; 3], [0; 3], scale, cols);
+        }
+
         if self.last_title.elapsed() > Duration::from_millis(500) {
             self.last_title = Instant::now();
             self.window.set_title(&format!(
-                "shadertoy | {w}x{h} | {:.0} fps | {}{}",
+                "shadertoy | {w}x{h} | render {:.2} ms | {:.0} fps | {}{}",
+                self.render_ms_ema,
                 self.fps_ema,
                 self.status,
                 if self.paused_at.is_some() { " | paused" } else { "" }

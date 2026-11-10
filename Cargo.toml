@@ -8,7 +8,9 @@ anyhow = "1.0.104"
 base64 = "0.23.1"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 crossterm = "0.29.0"
+font8x8 = "0.3.1"
 notify = "8.2.1"
+png = "0.18.1"
 pollster = "1.0.1"
 wgpu = { version = "30.0.1", features = ["glsl", "naga-ir"] }
 winit = "0.30.13"

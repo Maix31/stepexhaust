@@ -15,6 +15,11 @@ struct Args {
     scale: f32,
     kitty: bool,
     window: bool,
+    screenshot: Option<PathBuf>,
+    size: (u32, u32),
+    time: f32,
+    frame: i32,
+    stats: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -23,6 +28,11 @@ fn parse_args() -> Result<Args> {
     let mut scale = 1.0;
     let mut kitty = false;
     let mut window = false;
+    let mut screenshot = None;
+    let mut size = (960, 540);
+    let mut time = 0.0;
+    let mut frame = 0;
+    let mut stats = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -30,10 +40,27 @@ fn parse_args() -> Result<Args> {
             "--scale" => scale = it.next().context("--scale needs a value")?.parse()?,
             "--kitty" => kitty = true,
             "--window" | "-w" => window = true,
+            "--screenshot" => {
+                screenshot = Some(PathBuf::from(it.next().context("--screenshot needs a path")?))
+            }
+            "--size" => {
+                let v = it.next().context("--size needs WxH")?;
+                let (w, h) = v.split_once('x').context("--size must look like 960x540")?;
+                size = (w.parse()?, h.parse()?);
+            }
+            "--time" => time = it.next().context("--time needs seconds")?.parse()?,
+            "--stats" => stats = true,
+            "--frame" => frame = it.next().context("--frame needs a number")?.parse()?,
             "-h" | "--help" => {
                 println!(
                     "usage: shadertoy <shader.glsl> [--window] [--fps N] [--scale F] [--kitty]\n\n\
                      Live-reloading Shadertoy-style GLSL renderer for the terminal.\n\
+                     --screenshot OUT.png  render one frame headlessly to a PNG and exit
+                                 (non-zero exit + error on stderr if the shader fails)
+                     --size WxH  screenshot size (default 960x540)
+                     --time S    iTime for the screenshot (default 0)
+                     --stats     also burn the render-time overlay into the screenshot
+                     --frame N   iFrame for the screenshot (default 0)
                      --window    open a native window rendering at its real pixel size
                                  (ignores --fps/--scale/--kitty; vsync-paced)
                      --fps N     target frame rate (default 30)\n\
@@ -55,6 +82,11 @@ fn parse_args() -> Result<Args> {
         scale,
         kitty,
         window,
+        screenshot,
+        size,
+        time,
+        frame,
+        stats,
     })
 }
 
@@ -64,6 +96,28 @@ fn main() -> Result<()> {
         return window::run(args.file);
     }
     let mut gpu = gpu::Gpu::new()?;
+    if let Some(out) = &args.screenshot {
+        let src = std::fs::read_to_string(&args.file)
+            .with_context(|| format!("cannot open {}", args.file.display()))?;
+        if let Err(e) = gpu.set_shader(&src) {
+            anyhow::bail!("shader error:\n{e}");
+        }
+        let (w, h) = args.size;
+        gpu.render(w, h, args.time, 1.0 / 60.0, args.frame, [0.0; 4])?; // warm-up
+        let t0 = Instant::now();
+        gpu.render(w, h, args.time, 1.0 / 60.0, args.frame, [0.0; 4])?;
+        let ms = t0.elapsed().as_secs_f32() * 1000.0;
+        if args.stats {
+            gpu.set_overlay(&format!("{ms:.0}ms"), [150; 3], [0; 3], (h / 360).max(1), 32);
+        }
+        let px = gpu.render(w, h, args.time, 1.0 / 60.0, args.frame, [0.0; 4])?;
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(std::fs::File::create(out)?), w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header()?.write_image_data(px)?;
+        println!("wrote {} ({w}x{h}, t={}s, render {ms:.2} ms)", out.display(), args.time);
+        return Ok(());
+    }
     let adapter_name = gpu.adapter_name.clone();
 
     // File watching: watch the parent directory, because many editors save by
@@ -75,7 +129,8 @@ fn main() -> Result<()> {
     let target = abs.clone();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(ev) = res {
-            if ev.paths.iter().any(|p| p.file_name() == target.file_name()) {
+            // Ignore Access events: our own read of the file would otherwise retrigger a reload forever.
+            if !ev.kind.is_access() && ev.paths.iter().any(|p| p.file_name() == target.file_name()) {
                 let _ = tx.send(());
             }
         }
@@ -113,6 +168,7 @@ fn main() -> Result<()> {
     let mut frame_no: i32 = 0;
     let mut mouse = [0.0f32; 4];
     let mut fps_ema = args.fps as f32;
+    let mut render_ms_ema = 0.0f32;
 
     'main: loop {
         let deadline = Instant::now() + frame_dt;
@@ -190,16 +246,22 @@ fn main() -> Result<()> {
         .as_secs_f32();
 
         let (w, h) = term.pixel_size(args.scale);
+        // render() blocks until the GPU finished and the pixels are read back,
+        // so this is the full render + readback cost of the frame.
+        let render_start = Instant::now();
         let frame = gpu.render(w, h, t, delta, frame_no, mouse)?;
+        let render_ms = render_start.elapsed().as_secs_f32() * 1000.0;
+        render_ms_ema = if frame_no == 0 { render_ms } else { render_ms_ema * 0.9 + render_ms * 0.1 };
         if paused_at.is_none() {
             frame_no = frame_no.wrapping_add(1);
         }
 
         let info = format!(
-            "{} | {}x{} | {:.0} fps | {} | {}",
+            "{} | {}x{} | render {:.2} ms | {:.0} fps | {} | {}",
             args.file.file_name().unwrap().to_string_lossy(),
             w,
             h,
+            render_ms_ema,
             fps_ema,
             adapter_name,
             if paused_at.is_some() { "paused" } else { "" }

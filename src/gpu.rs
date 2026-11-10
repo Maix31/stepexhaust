@@ -41,6 +41,28 @@ fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
 }
 ";
 
+/// Draws the overlay bitmap (stats / error text) over the shader output.
+const OVERLAY_WGSL: &str = "
+struct P { scale: u32, w: u32, h: u32, pad: u32 };
+@group(0) @binding(0) var<uniform> prm: P;
+@group(0) @binding(1) var tex: texture_2d<f32>;
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    var p = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+    return vec4(p[i], 0.0, 1.0);
+}
+@fragment
+fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let q = vec2<u32>(pos.xy) / prm.scale;
+    if (q.x >= prm.w || q.y >= prm.h) { discard; }
+    return textureLoad(tex, vec2<i32>(q), 0);
+}
+";
+
+struct Overlay {
+    bind_group: wgpu::BindGroup,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
@@ -76,6 +98,9 @@ pub struct Gpu {
     format: wgpu::TextureFormat,
     target: Option<Target>,
     pixels: Vec<u8>,
+    overlay_bgl: wgpu::BindGroupLayout,
+    overlay_pipeline: Option<wgpu::RenderPipeline>,
+    overlay: Option<Overlay>,
 }
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -134,6 +159,32 @@ impl Gpu {
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() }],
         });
 
+        let overlay_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
         Ok(Self {
             adapter,
             device,
@@ -147,6 +198,9 @@ impl Gpu {
             format: FORMAT,
             target: None,
             pixels: Vec::new(),
+            overlay_bgl,
+            overlay_pipeline: None,
+            overlay: None,
         })
     }
 
@@ -241,10 +295,139 @@ impl Gpu {
         self.target = Some(Target { w, h, tex, view, readback, padded_row });
     }
 
+    /// Draw `text` (ASCII, `\n` separated, 8x8 font) in the top-left corner
+    /// over the shader output, `scale` pixels per font pixel. Lines longer than
+    /// `max_cols` wrap. An empty string removes the overlay.
+    pub fn set_overlay(&mut self, text: &str, fg: [u8; 3], bg: [u8; 3], scale: u32, max_cols: usize) {
+        const MAX_LINES: usize = 60;
+        if text.is_empty() {
+            self.overlay = None;
+            return;
+        }
+        let max_cols = max_cols.max(4);
+        // Wrap long lines instead of cutting them off.
+        let mut lines: Vec<String> = Vec::new();
+        for l in text.lines() {
+            let l: Vec<u8> = l
+                .chars()
+                .map(|c| if c == '\t' { ' ' } else if c.is_ascii() && !c.is_control() { c } else { '?' } as u8)
+                .collect();
+            if l.is_empty() {
+                lines.push(String::new());
+            }
+            for chunk in l.chunks(max_cols) {
+                lines.push(String::from_utf8_lossy(chunk).into_owned());
+            }
+        }
+        lines.truncate(MAX_LINES);
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        let cols = lines.iter().map(|l| l.len()).max().unwrap_or(1).max(1) as u32;
+        let pad = 4u32;
+        let (w, h) = (cols * 8 + 2 * pad, lines.len() as u32 * 9 + 2 * pad);
+        let mut data = vec![0u8; (w * h * 4) as usize];
+        for px in data.chunks_exact_mut(4) {
+            px.copy_from_slice(&[bg[0], bg[1], bg[2], 215]);
+        }
+        for (row, line) in lines.iter().enumerate() {
+            for (col, ch) in line.bytes().enumerate() {
+                let glyph = font8x8::legacy::BASIC_LEGACY[(ch & 0x7f) as usize];
+                for (gy, bits) in glyph.iter().enumerate() {
+                    for gx in 0..8u32 {
+                        if bits >> gx & 1 == 1 {
+                            let x = pad + col as u32 * 8 + gx;
+                            let y = pad + row as u32 * 9 + gy as u32;
+                            let i = ((y * w + x) * 4) as usize;
+                            data[i..i + 4].copy_from_slice(&[fg[0], fg[1], fg[2], 255]);
+                        }
+                    }
+                }
+            }
+        }
+
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &data,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        let ubuf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&ubuf, 0, bytemuck::bytes_of(&[scale.max(1), w, h, 0u32]));
+        let view = tex.create_view(&Default::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.overlay_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+            ],
+        });
+        self.overlay = Some(Overlay { bind_group });
+
+        if self.overlay_pipeline.is_none() {
+            let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("overlay"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(OVERLAY_WGSL)),
+            });
+            let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&self.overlay_bgl)],
+                immediate_size: 0,
+            });
+            self.overlay_pipeline = Some(self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: None,
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: self.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            }));
+        }
+    }
+
     /// Set the colour format of the render pipeline (window mode: the surface
     /// format). Takes effect for shaders compiled afterwards.
     pub fn set_format(&mut self, format: wgpu::TextureFormat) {
         self.format = format;
+        self.overlay_pipeline = None;
     }
 
     /// Render one frame straight into `view` (e.g. a swapchain texture).
@@ -305,6 +488,11 @@ impl Gpu {
             if let Some(p) = &self.pipeline {
                 pass.set_pipeline(p);
                 pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            if let (Some(p), Some(o)) = (&self.overlay_pipeline, &self.overlay) {
+                pass.set_pipeline(p);
+                pass.set_bind_group(0, &o.bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
         }
