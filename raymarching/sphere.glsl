@@ -1,10 +1,10 @@
-#define MAX_STEPS 100
+#define MAX_STEPS 1000
 #define MAX_DISTANCE 1e3
 
+#define NO_HIT_STEP_EXHAUST_MAT -2
+#define NO_HIT_DISTANCE_EXHAUST_MAT -1
 #define SPHERE_MAT 0
 #define FLOOR_MAT 1
-#define NO_HIT_DISTANCE_EXHAUST_MAT 2
-#define NO_HIT_STEP_EXHAUST_MAT 3
 
 struct DirectionalLight
 {
@@ -17,21 +17,43 @@ struct Sphere
     vec3 p;
     float r;
     int m;
+    vec3 c;
 };
 
 struct RayMarchResult
 {
     vec3 p;
-    int m;
+    float min_d;
+    int i;
 };
 
-#define sr 2.0
-#define fr 6e2
+#define SPHERE_COUNT 10
+
+uint xorshift32(out uint seed) {
+	// Algorithm "xor" from p. 4 of Marsaglia, "Xorshift RNGs"
+	uint x = seed;
+	x ^= x << 13;
+	x ^= x >> 17;
+	x ^= x << 5;
+	return seed = x;
+}
+
+float random(float min, float max, out uint seed)
+{
+    uint value =xorshift32(seed);
+    uint max_value = ~0U;
+    float t = float(value) / float(max_value);
+    return mix(min, max, t);
+}
+
+vec3 random_color(out uint seed)
+{
+    return vec3(random(0,1,seed), random(0,1,seed), random(0,1,seed));        
+}
 
 struct Scene
 {
-    Sphere s;
-    Sphere f;
+    Sphere s[SPHERE_COUNT];
     DirectionalLight dl;
 };
 
@@ -40,19 +62,20 @@ float sphere(vec3 p, float r)
     return length(p) - r;
 }
 
-float map(vec3 p, Scene s, out int m)
+float map(vec3 p, Scene s, out int i_out)
 {
-    float sd = sphere(s.s.p - p, s.s.r);
-    float fd = sphere(s.f.p - p, s.f.r);
-    if (sd < fd)
+    float min_d = sphere(s.s[0].p - p, s.s[0].r);
+    i_out = 0;
+    for (int i = 1; i < SPHERE_COUNT; i++)
     {
-        m = s.s.m;
-        return sd;
-    } else
-    {
-        m = s.f.m;
-        return fd;
+        float sd = sphere(s.s[i].p - p, s.s[i].r);
+        if (min_d > sd)
+        {
+            min_d = sd;
+            i_out = i;
+        }
     }
+    return min_d;
 }
 
 vec3 normal(vec3 p, Scene s)
@@ -72,33 +95,41 @@ vec3 normal(vec3 p, Scene s)
     ));
 }
 
-RayMarchResult ray_march(vec3 ro, vec3 rd, Scene s)
+bool is_no_hit(int m)
+{
+    return m == NO_HIT_DISTANCE_EXHAUST_MAT || m == NO_HIT_STEP_EXHAUST_MAT; 
+}
+
+RayMarchResult ray_march(vec3 ro, vec3 rd, Scene s, int max_steps, float max_distance)
 {
     vec3 c = vec3(0);
     RayMarchResult r;
     r.p = ro;
+    r.min_d = 1e20;
     float t = 0.;
-    for (int i = 0; i < MAX_STEPS; i++)
+    for (int i = 0; i < max_steps; i++)
     {
-        float d = map(r.p, s, r.m);
+        float d = map(r.p, s, r.i);
         float eps = max(1e-4, 0.5 * t / iResolution.y);
+
+        r.p += rd * d;
+        t += d;
+
+        r.min_d = min(d / t, r.min_d);
 
         if (d < eps)
         {
             return r;
         }
         
-        if (t > MAX_DISTANCE)
+        if (t > max_distance)
         {
-            r.m = NO_HIT_DISTANCE_EXHAUST_MAT;
+            r.i = NO_HIT_DISTANCE_EXHAUST_MAT;
             return r;
         }
-
-        r.p += rd * d;
-        t += d;
     }
 
-    r.m = NO_HIT_STEP_EXHAUST_MAT;
+    r.i = NO_HIT_STEP_EXHAUST_MAT;
     return r;
 }
 
@@ -111,22 +142,24 @@ vec3 phong_bling(in Scene s, vec3 p)
 
 vec3 checker(vec3 p)
 {
-        
     vec2 g = floor(p.xz);
     return vec3(mod(g.x + g.y, 2.0));
 }
+
 vec3 color(int m, in Scene s, vec3 p)
 {
     switch (m) {
-        case SPHERE_MAT: {
-           return checker(p);
-           // return phong_bling(s, p);
-        }
-        // case FLOOR_MAT: return vec3(1);
+        case SPHERE_MAT:
         case FLOOR_MAT:
         {
-            return checker(p);
+           vec3 n = normal(p, s);
+           RayMarchResult r = ray_march(p + n * 0.01, s.dl.d, s, 100, 100.);
+           float k = sin(iTime) * 2 + 6;
+           return 
+           // return vec3(clamp(k * r.min_d, 0, 1));
+           // return checker(p);
         }
+        // case FLOOR_MAT: return vec3(1);
         // case NO_HIT_DISTANCE_EXHAUST_MAT: return vec3(0,1,1);
         case NO_HIT_DISTANCE_EXHAUST_MAT:
         case NO_HIT_STEP_EXHAUST_MAT: return vec3(1,0,1);
@@ -135,11 +168,50 @@ vec3 color(int m, in Scene s, vec3 p)
     return vec3(0);
 }
 
+void generate_spheres(inout Scene s, out uint seed)
+{
+    s.s[0] = Sphere(vec3(0, -6e2, 10), 6e2, SPHERE_MAT, random_color(seed));
+    vec2 r_range = vec2(0.2, 1.2);
+    vec2 area = vec2(-5, 5);
+    for (int i = 1; i < SPHERE_COUNT; i++)
+    {
+        for(int tries = 0; tries < 50; tries++)
+        {
+            float r = random(r_range.x, r_range.y, seed);
+            vec3 p = vec3(random(area.x, area.y, seed), r, random(area.x, area.y, seed));
+            bool free = true;
+            for(int j = 0; j < i; j++)
+            {
+                if (distance(s.s[i].p, s.s[j].p) - s.s[i].r - s.s[j].r < 0)
+                {
+                    free = false;
+                    break;
+                }
+            }
+
+            if (free)
+            {
+                s.s[i] = Sphere(p, r, SPHERE_MAT, random_color(seed));
+                break;        
+            }
+        }            
+    }
+
+    // s.s[1] = Sphere(vec3(2, 1, 2), 1, SPHERE_MAT);
+    // s.s[2] = Sphere(vec3(0.5, 0.2, 3), 0.2, SPHERE_MAT);
+    // s.s[3] = Sphere(vec3(-5, 0.3, 5), 0.3, SPHERE_MAT);
+    // s.s[4] = Sphere(vec3(5, 0.7, 10), 0.7, SPHERE_MAT);
+    // s.s[5] = Sphere(vec3(0, 1, 2), 1, SPHERE_MAT);
+    // s.s[6] = Sphere(vec3(0, 0.2, 3), 0.2, SPHERE_MAT);
+    // s.s[7] = Sphere(vec3(0, 0.3, 5), 0.3, SPHERE_MAT);       
+}
+
 void mainImage( out vec4 fragColor, in vec2 fragCoord )
 {
+    uint seed = 1337;
     Scene s;
-    s.s = Sphere(vec3(0, sr, 10), sr, SPHERE_MAT);
-    s.f = Sphere(vec3(0, -fr, 10), fr, FLOOR_MAT);
+    generate_spheres(s, seed);
+
     s.dl.d = normalize(vec3(-5,10,-10)- vec3(0,0,10));
     s.dl.c = vec3(219. / 255., 192. / 255., 151. / 255.);
 
@@ -147,7 +219,7 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord )
     vec3 ro = vec3(0, 5,-10);
     vec3 rd = normalize(vec3(uv, 1));
 
-    RayMarchResult r = ray_march(ro, rd, s);
+    RayMarchResult r = ray_march(ro, rd, s, MAX_STEPS, MAX_DISTANCE);
     vec3 c = color(r.m, s, r.p);
     // uv *= 10;
     // c = vec3(step(.5, fract(uv.x)));
