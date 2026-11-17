@@ -97,9 +97,7 @@ fn main() -> Result<()> {
     }
     let mut gpu = gpu::Gpu::new()?;
     if let Some(out) = &args.screenshot {
-        let src = std::fs::read_to_string(&args.file)
-            .with_context(|| format!("cannot open {}", args.file.display()))?;
-        if let Err(e) = gpu.set_shader(&src) {
+        if let Err(e) = gpu.load_files(&args.file) {
             anyhow::bail!("shader error:\n{e}");
         }
         let (w, h) = args.size;
@@ -127,10 +125,18 @@ fn main() -> Result<()> {
     let dir = abs.parent().unwrap().to_path_buf();
     let (tx, rx) = mpsc::channel();
     let target = abs.clone();
+    let buffer_target = gpu::buffer_path(&abs);
+    let common_target = gpu::common_path(&abs);
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(ev) = res {
             // Ignore Access events: our own read of the file would otherwise retrigger a reload forever.
-            if !ev.kind.is_access() && ev.paths.iter().any(|p| p.file_name() == target.file_name()) {
+            if !ev.kind.is_access()
+                && ev.paths.iter().any(|p| {
+                    p.file_name() == target.file_name()
+                        || p.file_name() == buffer_target.file_name()
+                        || p.file_name() == common_target.file_name()
+                })
+            {
                 let _ = tx.send(());
             }
         }
@@ -140,19 +146,13 @@ fn main() -> Result<()> {
     let mut status = String::new();
     let mut status_is_err = false;
     let load = |gpu: &mut gpu::Gpu, status: &mut String, is_err: &mut bool| {
-        match std::fs::read_to_string(&abs) {
-            Ok(src) => match gpu.set_shader(&src) {
-                Ok(()) => {
-                    *status = "ok".into();
-                    *is_err = false;
-                }
-                Err(e) => {
-                    *status = e;
-                    *is_err = true;
-                }
-            },
+        match gpu.load_files(&abs) {
+            Ok(()) => {
+                *status = "ok".into();
+                *is_err = false;
+            }
             Err(e) => {
-                *status = format!("read error: {e}");
+                *status = e;
                 *is_err = true;
             }
         }

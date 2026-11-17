@@ -49,10 +49,18 @@ pub fn run(file: PathBuf) -> Result<()> {
     let dir = abs.parent().unwrap().to_path_buf();
     let (tx, rx) = mpsc::channel();
     let target = abs.clone();
+    let buffer_target = crate::gpu::buffer_path(&abs);
+    let common_target = crate::gpu::common_path(&abs);
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(ev) = res {
             // Ignore Access events: our own read of the file would otherwise retrigger a reload forever.
-            if !ev.kind.is_access() && ev.paths.iter().any(|p| p.file_name() == target.file_name()) {
+            if !ev.kind.is_access()
+                && ev.paths.iter().any(|p| {
+                    p.file_name() == target.file_name()
+                        || p.file_name() == buffer_target.file_name()
+                        || p.file_name() == common_target.file_name()
+                })
+            {
                 let _ = tx.send(());
             }
         }
@@ -121,9 +129,7 @@ impl State {
     }
 
     fn load(&mut self, file: &PathBuf) {
-        let res = std::fs::read_to_string(file)
-            .map_err(|e| format!("read error: {e}"))
-            .and_then(|src| self.gpu.set_shader(&src));
+        let res = self.gpu.load_files(file);
         match res {
             Ok(()) => {
                 self.last_err = None;

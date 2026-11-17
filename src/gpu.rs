@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use std::borrow::Cow;
+use std::path::{Path, PathBuf};
 use wgpu::naga;
 
 /// Number of lines in PROLOGUE, so error line numbers match the user's file.
@@ -21,9 +22,14 @@ layout(set = 0, binding = 0) uniform ShadertoyUniforms {
 #define iTime u_time
 #define iTimeDelta u_delta
 #define iFrame u_frame
+// iChannel0: in the Image pass, the latest output of Buffer A; in Buffer A,
+// its own previous frame. Use texelFetch(iChannel0, ivec2(x, y), 0).
+layout(set = 1, binding = 0) uniform texture2D _ch0_tex;
+layout(set = 1, binding = 1) uniform sampler _ch0_smp;
+#define iChannel0 sampler2D(_ch0_tex, _ch0_smp)
 layout(location = 0) out vec4 _fragColor;
 ";
-const PROLOGUE_LINES: u32 = 19;
+const PROLOGUE_LINES: u32 = 24;
 
 const EPILOGUE: &str = "
 void main() {
@@ -32,6 +38,20 @@ void main() {
     _fragColor = vec4(c.rgb, 1.0);
 }
 ";
+
+/// Buffer passes write raw float data: no alpha forcing, and fragCoord.y is the
+/// texel row (not flipped), so `texelFetch(iChannel0, ivec2(fragCoord), 0)` in
+/// the pass reads back exactly what that pixel wrote last frame.
+const BUFFER_EPILOGUE: &str = "
+void main() {
+    vec4 c = vec4(0.0);
+    mainImage(c, gl_FragCoord.xy);
+    _fragColor = c;
+}
+";
+
+/// Buffers hold data (positions etc.), so they need float precision.
+const BUFFER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
 const VERTEX: &str = "
 @vertex
@@ -84,13 +104,27 @@ struct Target {
     padded_row: u32,
 }
 
+/// Buffer A: two canvas-sized float textures that swap roles every frame
+/// (a pass cannot read and write the same texture).
+struct Buffer {
+    w: u32,
+    h: u32,
+    views: [wgpu::TextureView; 2],
+    /// binds[i] exposes texture i as iChannel0.
+    binds: [wgpu::BindGroup; 2],
+    /// Index of the texture holding the most recently written frame.
+    cur: usize,
+    /// Frames rendered since the buffer was (re)created; used as iFrame in the
+    /// buffer pass so `iFrame == 0` means "initialise" even after reload/resize.
+    frames: i32,
+}
+
 pub struct Gpu {
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub adapter_name: String,
     vs: wgpu::ShaderModule,
-    bgl: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
     ubuf: wgpu::Buffer,
     pipeline: Option<wgpu::RenderPipeline>,
@@ -101,6 +135,42 @@ pub struct Gpu {
     overlay_bgl: wgpu::BindGroupLayout,
     overlay_pipeline: Option<wgpu::RenderPipeline>,
     overlay: Option<Overlay>,
+    pipeline_layout: wgpu::PipelineLayout,
+    chan_bgl: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    /// 1x1 stand-in for iChannel0 when there is no buffer.
+    dummy_bind: wgpu::BindGroup,
+    ubuf_a: wgpu::Buffer,
+    bind_group_a: wgpu::BindGroup,
+    buffer_pipeline: Option<wgpu::RenderPipeline>,
+    buffer: Option<Buffer>,
+}
+
+/// `foo.glsl` -> `foo.<kind>.glsl` (kind: "bufferA" or "common")
+fn sibling_path(main: &Path, kind: &str) -> PathBuf {
+    let stem = main.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    main.with_file_name(format!("{stem}.{kind}.glsl"))
+}
+
+/// File names used to label shader errors.
+pub struct Names {
+    pub image: String,
+    pub buffer: String,
+    pub common: String,
+}
+
+fn file_name(p: &Path) -> String {
+    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// `foo.glsl` -> `foo.bufferA.glsl`
+pub fn buffer_path(main: &Path) -> PathBuf {
+    sibling_path(main, "bufferA")
+}
+
+/// `foo.glsl` -> `foo.common.glsl` (prepended to every pass, like Shadertoy's Common tab)
+pub fn common_path(main: &Path) -> PathBuf {
+    sibling_path(main, "common")
 }
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -185,13 +255,62 @@ impl Gpu {
             ],
         });
 
+        let chan_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+            ],
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&bgl), Some(&chan_bgl)],
+            immediate_size: 0,
+        });
+        let dummy_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: BUFFER_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let dummy_bind = chan_bind(&device, &chan_bgl, &sampler, &dummy_tex.create_view(&Default::default()));
+        let ubuf_a = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bgl,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: ubuf_a.as_entire_binding() }],
+        });
+
         Ok(Self {
             adapter,
             device,
             queue,
             adapter_name,
             vs,
-            bgl,
             bind_group,
             ubuf,
             pipeline: None,
@@ -201,16 +320,76 @@ impl Gpu {
             overlay_bgl,
             overlay_pipeline: None,
             overlay: None,
+            pipeline_layout,
+            chan_bgl,
+            sampler,
+            dummy_bind,
+            ubuf_a,
+            bind_group_a,
+            buffer_pipeline: None,
+            buffer: None,
         })
     }
 
-    /// Compile a Shadertoy-style fragment shader. On failure the previous
-    /// pipeline is kept, so the last good frame keeps rendering.
-    pub fn set_shader(&mut self, user_src: &str) -> std::result::Result<(), String> {
+    /// Load `main` plus its optional siblings `<name>.bufferA.glsl` and
+    /// `<name>.common.glsl` (code shared by every pass). Both are
+    /// compiled before anything is swapped in, so an error in either keeps the
+    /// last good frame rendering.
+    pub fn load_files(&mut self, main: &Path) -> std::result::Result<(), String> {
+        let image = std::fs::read_to_string(main).map_err(|e| format!("{}: read error: {e}", file_name(main)))?;
+        let optional = |path: PathBuf| match std::fs::read_to_string(&path) {
+            Ok(src) => Ok(Some(src)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("{}: read error: {e}", file_name(&path))),
+        };
+        let buffer = optional(buffer_path(main))?;
+        let common = optional(common_path(main))?.unwrap_or_default();
+        let names = Names {
+            image: file_name(main),
+            buffer: file_name(&buffer_path(main)),
+            common: file_name(&common_path(main)),
+        };
+        self.set_shaders(&image, buffer.as_deref(), &common, &names)
+    }
+
+    /// Compile the Image shader and an optional Buffer A shader.
+    pub fn set_shaders(
+        &mut self,
+        image_src: &str,
+        buffer_src: Option<&str>,
+        common: &str,
+        names: &Names,
+    ) -> std::result::Result<(), String> {
+        let image_fs = self.compile(image_src, common, EPILOGUE, &names.image, &names.common)?;
+        let buffer_fs = match buffer_src {
+            Some(src) => Some(self.compile(src, common, BUFFER_EPILOGUE, &names.buffer, &names.common)?),
+            None => None,
+        };
+        self.pipeline = Some(self.make_pipeline(&image_fs, self.format));
+        self.buffer_pipeline = buffer_fs.map(|fs| self.make_pipeline(&fs, BUFFER_FORMAT));
+        self.buffer = None; // start from zeroed textures with iFrame == 0
+        Ok(())
+    }
+
+    /// Compile a Shadertoy-style fragment shader. Errors carry user-file line numbers.
+    /// Errors are reported as `file:line: message`, where `file` is `src_name`
+    /// for the pass source and `common_name` for the shared common code.
+    fn compile(
+        &self,
+        user_src: &str,
+        common: &str,
+        epilogue: &str,
+        src_name: &str,
+        common_name: &str,
+    ) -> std::result::Result<wgpu::ShaderModule, String> {
         if !user_src.contains("mainImage") {
-            return Err("no mainImage(out vec4, in vec2) function found".into());
+            return Err(format!("{src_name}: no mainImage(out vec4, in vec2) function found"));
         }
-        let full = format!("{PROLOGUE}{user_src}\n{EPILOGUE}");
+        // Common code goes between the prologue and the pass source.
+        let common = common.trim_end_matches('\n');
+        let common_lines = common.lines().count() as u32;
+        let common_block = if common.is_empty() { String::new() } else { format!("{common}\n") };
+        let full = format!("{PROLOGUE}{common_block}{user_src}\n{epilogue}");
         debug_assert_eq!(PROLOGUE.lines().count() as u32, PROLOGUE_LINES);
 
         let mut frontend = naga::front::glsl::Frontend::default();
@@ -225,7 +404,11 @@ impl Gpu {
                             .location(&full)
                             .line_number
                             .saturating_sub(PROLOGUE_LINES);
-                        format!("line {line}: {}", e.kind)
+                        if line <= common_lines {
+                            format!("{common_name}:{line}: {}", e.kind)
+                        } else {
+                            format!("{src_name}:{}: {}", line - common_lines, e.kind)
+                        }
                     })
                     .collect::<Vec<_>>()
                     .join("\n")
@@ -233,20 +416,18 @@ impl Gpu {
         fix_unemitted_call_pointers(&mut module);
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
             .validate(&module)
-            .map_err(|e| format!("{}", e.as_inner()))?;
+            .map_err(|e| format!("{src_name}: {}", e.as_inner()))?;
 
-        let fs = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        Ok(self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("fs"),
             source: wgpu::ShaderSource::Naga(Cow::Owned(module)),
-        });
-        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        }))
+    }
+
+    fn make_pipeline(&self, fs: &wgpu::ShaderModule, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
+        self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: None,
-            bind_group_layouts: &[Some(&self.bgl)],
-            immediate_size: 0,
-        });
-        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: None,
-            layout: Some(&layout),
+            layout: Some(&self.pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &self.vs,
                 entry_point: Some("vs"),
@@ -254,19 +435,78 @@ impl Gpu {
                 buffers: &[],
             },
             fragment: Some(wgpu::FragmentState {
-                module: &fs,
+                module: fs,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
-                targets: &[Some(self.format.into())],
+                targets: &[Some(format.into())],
             }),
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
-        });
-        self.pipeline = Some(pipeline);
-        Ok(())
+        })
+    }
+
+    fn make_buffer(&self, w: u32, h: u32) -> Buffer {
+        let mk = || {
+            self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("buffer A"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: BUFFER_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+        };
+        let views = [mk().create_view(&Default::default()), mk().create_view(&Default::default())];
+        let binds = [
+            chan_bind(&self.device, &self.chan_bgl, &self.sampler, &views[0]),
+            chan_bind(&self.device, &self.chan_bgl, &self.sampler, &views[1]),
+        ];
+        Buffer { w, h, views, binds, cur: 0, frames: 0 }
+    }
+
+    /// Run the Buffer A pass (if there is one): read texture `cur`, write the
+    /// other one, then swap. Must be encoded before the Image pass.
+    fn run_buffer(&mut self, enc: &mut wgpu::CommandEncoder, w: u32, h: u32, time: f32, delta: f32, mouse: [f32; 4]) {
+        let Some(pipe) = self.buffer_pipeline.clone() else {
+            self.buffer = None;
+            return;
+        };
+        if !matches!(&self.buffer, Some(b) if b.w == w && b.h == h) {
+            self.buffer = Some(self.make_buffer(w, h));
+        }
+        let b = self.buffer.as_mut().unwrap();
+        let u = Self::uniforms(w, h, time, delta, b.frames, mouse);
+        self.queue.write_buffer(&self.ubuf_a, 0, bytemuck::bytes_of(&u));
+        let dst = 1 - b.cur;
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("buffer A"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &b.views[dst],
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&pipe);
+            pass.set_bind_group(0, &self.bind_group_a, &[]);
+            pass.set_bind_group(1, &b.binds[b.cur], &[]);
+            pass.draw(0..3, 0..1);
+        }
+        b.cur = dst;
+        b.frames = b.frames.wrapping_add(1);
     }
 
     fn ensure_target(&mut self, w: u32, h: u32) {
@@ -443,11 +683,17 @@ impl Gpu {
     ) {
         self.write_uniforms(w, h, time, delta, frame, mouse);
         let mut enc = self.device.create_command_encoder(&Default::default());
+        self.run_buffer(&mut enc, w, h, time, delta, mouse);
         self.draw_pass(&mut enc, view);
         self.queue.submit([enc.finish()]);
     }
 
     fn write_uniforms(&self, w: u32, h: u32, time: f32, delta: f32, frame: i32, mouse: [f32; 4]) {
+        let u = Self::uniforms(w, h, time, delta, frame, mouse);
+        self.queue.write_buffer(&self.ubuf, 0, bytemuck::bytes_of(&u));
+    }
+
+    fn uniforms(w: u32, h: u32, time: f32, delta: f32, frame: i32, mouse: [f32; 4]) -> Uniforms {
         let date = {
             let secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -455,7 +701,7 @@ impl Gpu {
                 .unwrap_or(0.0);
             [0.0, 0.0, 0.0, secs % 86400.0]
         };
-        let u = Uniforms {
+        Uniforms {
             res: [w as f32, h as f32, 1.0, 0.0],
             mouse,
             date,
@@ -463,8 +709,7 @@ impl Gpu {
             delta,
             frame,
             _pad: 0.0,
-        };
-        self.queue.write_buffer(&self.ubuf, 0, bytemuck::bytes_of(&u));
+        }
     }
 
     fn draw_pass(&self, enc: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
@@ -488,6 +733,8 @@ impl Gpu {
             if let Some(p) = &self.pipeline {
                 pass.set_pipeline(p);
                 pass.set_bind_group(0, &self.bind_group, &[]);
+                let chan = self.buffer.as_ref().map_or(&self.dummy_bind, |b| &b.binds[b.cur]);
+                pass.set_bind_group(1, chan, &[]);
                 pass.draw(0..3, 0..1);
             }
             if let (Some(p), Some(o)) = (&self.overlay_pipeline, &self.overlay) {
@@ -512,6 +759,7 @@ impl Gpu {
         self.ensure_target(w, h);
         self.write_uniforms(w, h, time, delta, frame, mouse);
         let mut enc = self.device.create_command_encoder(&Default::default());
+        self.run_buffer(&mut enc, w, h, time, delta, mouse);
         self.draw_pass(&mut enc, &self.target.as_ref().unwrap().view);
         let t = self.target.as_ref().unwrap();
         enc.copy_texture_to_buffer(
@@ -551,6 +799,22 @@ impl Gpu {
         t.readback.unmap();
         Ok(&self.pixels)
     }
+}
+
+fn chan_bind(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+        ],
+    })
 }
 
 /// Work around a naga bug: the SPIR-V backend panics ("Expression [n] is not
